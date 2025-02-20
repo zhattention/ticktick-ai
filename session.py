@@ -69,7 +69,7 @@ class Session:
         self.voice_queue = asyncio.Queue()  # Create input queue
         self.message_handler: Optional[MessageHandler] = None
 
-    async def start_session(self, text: str, message_handler: MessageHandler):
+    def start_session(self, text: str, message_handler: MessageHandler):
         """
         Start a new session, create stream and start execution task.
         
@@ -127,7 +127,7 @@ class Session:
             # No active session, create new one
             if message_handler is None:
                 raise ValueError("message_handler must be provided when creating a new session")
-            await self.start_session(text, message_handler)
+            self.start_session(text, message_handler)
             logging.info(f"Creating new session with initial input: {text}")
         else:
             # Active session exists, inject input into current stream
