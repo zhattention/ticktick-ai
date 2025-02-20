@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>实时语音转文字</title>
+  <style>
+    /* Basic reset and body styling */
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #f4f7f9;
+      color: #333;
+    }
+    .container {
+      max-width: 600px;
+      margin: 40px auto;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+      padding: 20px;
+    }
+    h1 {
+      text-align: center;
+      color: #4CAF50;
+      margin-bottom: 20px;
+    }
+    #status {
+      margin: 20px 0;
+      padding: 15px;
+      border-radius: 5px;
+      text-align: center;
+      background-color: #fff3cd;
+      color: #856404;
+    }
+    #transcription {
+      margin-top: 20px;
+      padding: 15px;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      min-height: 100px;
+      background-color: #fafafa;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .btn {
+      display: inline-block;
+      padding: 10px 20px;
+      font-size: 16px;
+      cursor: pointer;
+      background-color: #4CAF50;
+      color: #fff;
+      border: none;
+      border-radius: 5px;
+      transition: background-color 0.3s ease;
+      margin: 5px;
+    }
+    .btn:disabled {
+      background-color: #ccc;
+      cursor: not-allowed;
+    }
+    .btn.recording {
+      background-color: #f44336;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>实时语音转文字</h1>
+    <div id="status">等待连接...</div>
+    <div style="text-align: center;">
+      <button id="recordButton" class="btn">开始录音</button>
+    </div>
+    <div id="transcription"></div>
+  </div>
+
+  <script>
+    // --- WAV conversion functions ---
+    function audioBufferToWav(buffer) {
+      const numChannels = buffer.numberOfChannels;
+      const sampleRate = buffer.sampleRate;
+      const format = 1; // PCM
+      const bitDepth = 16;
+      
+      const bytesPerSample = bitDepth / 8;
+      const blockAlign = numChannels * bytesPerSample;
+      const dataSize = buffer.length * blockAlign;
+      const headerSize = 44;
+      const totalSize = headerSize + dataSize;
+      
+      const arrayBuffer = new ArrayBuffer(totalSize);
+      const dataView = new DataView(arrayBuffer);
+      
+      // RIFF header
+      writeString(dataView, 0, 'RIFF');
+      dataView.setUint32(4, totalSize - 8, true);
+      writeString(dataView, 8, 'WAVE');
+      
+      // fmt sub-chunk
+      writeString(dataView, 12, 'fmt ');
+      dataView.setUint32(16, 16, true);
+      dataView.setUint16(20, format, true);
+      dataView.setUint16(22, numChannels, true);
+      dataView.setUint32(24, sampleRate, true);
+      dataView.setUint32(28, sampleRate * blockAlign, true);
+      dataView.setUint16(32, blockAlign, true);
+      dataView.setUint16(34, bitDepth, true);
+      
+      // data sub-chunk
+      writeString(dataView, 36, 'data');
+      dataView.setUint32(40, dataSize, true);
+      
+      // Write audio data
+      const channelData = [];
+      for (let channel = 0; channel < numChannels; channel++) {
+        channelData[channel] = buffer.getChannelData(channel);
+      }
+      
+      let offset = 44;
+      for (let i = 0; i < buffer.length; i++) {
+        for (let channel = 0; channel < numChannels; channel++) {
+          let sample = Math.max(-1, Math.min(1, channelData[channel][i]));
+          const value = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+          dataView.setInt16(offset, value, true);
+          offset += bytesPerSample;
+        }
+      }
+      
+      return arrayBuffer;
+    }
+    
+    function writeString(dataView, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        dataView.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+    
+    // --- Variables and DOM elements ---
+    let isRecording = false;
+    let mediaRecorder;
+    let audioChunks = [];
+    let ws;
+    
+    const statusEl = document.getElementById('status');
+    const transcriptionEl = document.getElementById('transcription');
+    const recordButton = document.getElementById('recordButton');
+    
+    // --- WebSocket connection ---
+    function connectWebSocket() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws`;
+      console.log('Connecting to WebSocket:', wsUrl);
+      ws = new WebSocket(wsUrl);
+      
+      ws.onopen = () => {
+        updateStatus('已连接到服务器', '#d1e7dd');
+        recordButton.disabled = false;
+      };
+  
+      ws.onmessage = (event) => {
+        transcriptionEl.textContent = event.data;
+      };
+  
+      ws.onclose = () => {
+        updateStatus('连接已断开，正在重连...', '#f8d7da');
+        recordButton.disabled = true;
+        setTimeout(connectWebSocket, 3000);
+      };
+  
+      ws.onerror = (error) => {
+        console.error('WebSocket错误:', error);
+        updateStatus('连接错误', '#f8d7da');
+      };
+    }
+    
+    // Update status display with message and background color
+    function updateStatus(message, bgColor) {
+      statusEl.textContent = message;
+      statusEl.style.backgroundColor = bgColor;
+    }
+    
+    // --- Recording Functions ---
+    async function startRecording() {
+      try {
+        updateStatus('请求麦克风权限...', '#fff3cd');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, sampleRate: 16000 }
+        });
+        updateStatus('录音中...', '#d1e7dd');
+        
+        // Determine supported MIME type
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : 'audio/webm';
+        console.log('Using audio format:', mimeType);
+        
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(stream, { mimeType });
+  
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunks.push(event.data);
+          }
+        };
+  
+        mediaRecorder.onstop = () => {
+          // Automatically send audio after stopping
+          sendAudio();
+          // Stop all audio tracks
+          stream.getTracks().forEach(track => track.stop());
+        };
+  
+        mediaRecorder.start(100); // Collect audio chunks every 100ms
+        isRecording = true;
+        recordButton.textContent = '停止录音';
+        recordButton.classList.add('recording');
+      } catch (err) {
+        console.error('错误:', err);
+        updateStatus('无法访问麦克风', '#f8d7da');
+      }
+    }
+    
+    function stopRecording() {
+      if (mediaRecorder && isRecording) {
+        mediaRecorder.stop();
+        isRecording = false;
+        recordButton.textContent = '开始录音';
+        recordButton.classList.remove('recording');
+        updateStatus('录音已停止，正在上传...', '#fff3cd');
+      }
+    }
+    
+    // --- Upload Function ---
+    function sendAudio() {
+      if (audioChunks.length === 0) {
+        console.warn('没有录制到音频数据');
+        updateStatus('未检测到音频数据', '#f8d7da');
+        return;
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+        console.log('合并的音频数据大小:', blob.size, 'bytes');
+        
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const base64Data = reader.result;
+          console.log('发送base64数据，大小:', base64Data.length);
+          ws.send(base64Data);
+          updateStatus('音频已上传', '#d1e7dd');
+        };
+        reader.onerror = (err) => {
+          console.error('读取音频数据错误:', err);
+          updateStatus('音频上传失败', '#f8d7da');
+        };
+        reader.readAsDataURL(blob);
+      } else {
+        console.warn('WebSocket连接未就绪');
+        updateStatus('无法上传，服务器未连接', '#f8d7da');
+      }
+    }
+    
+    // --- Button Event Listener ---
+    recordButton.addEventListener('click', () => {
+      if (!isRecording) {
+        startRecording();
+      } else {
+        stopRecording();
+      }
+    });
+    
+    // --- Initialize ---
+    connectWebSocket();
+  </script>
+</body>
+</html>

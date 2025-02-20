@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ticktick Voice Control</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .status {
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .status.connecting { background: #fff3cd; }
+        .status.connected { background: #d4edda; }
+        .status.error { background: #f8d7da; }
+        .transcript {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            min-height: 100px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            background: #007bff;
+            color: white;
+            cursor: pointer;
+        }
+        button:disabled {
+            background: #ccc;
+        }
+        button:hover:not(:disabled) {
+            background: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Ticktick 语音控制</h1>
+        <div id="status" class="status">正在初始化...</div>
+        <div class="controls">
+            <button id="startBtn">开始录音</button>
+            <button id="stopBtn" disabled>停止录音</button>
+        </div>
+        <div class="transcript" id="transcript"></div>
+    </div>
+
+    <script>
+        class VoiceControl {
+            constructor() {
+                this.pc = null;
+                this.dataChannel = null;
+                this.audioElement = document.createElement('audio');
+                this.audioElement.autoplay = true;
+                this.sessionUpdatePending = false;
+                
+                this.startBtn = document.getElementById('startBtn');
+                this.stopBtn = document.getElementById('stopBtn');
+                this.statusDiv = document.getElementById('status');
+                this.transcriptDiv = document.getElementById('transcript');
+                
+                this.setupEventListeners();
+                this.init().catch(error => {
+                    console.error('初始化错误:', error);
+                    this.updateStatus('初始化失败: ' + error.message, 'error');
+                });
+            }
+
+            async init() {
+                this.updateStatus('正在初始化...', 'connecting');
+                try {
+                    // 获取ephemeral token
+                    const response = await fetch('/api/oai/get_token');
+                    const data = await response.json();
+                    const token = data.client_secret.value;
+
+                    // 创建WebRTC连接
+                    this.pc = new RTCPeerConnection();
+                    
+                    // 设置音频输出
+                    const audioEl = document.createElement('audio');
+                    audioEl.autoplay = true;
+                    this.pc.ontrack = e => audioEl.srcObject = e.streams[0];
+
+                    // 获取麦克风权限并添加音频轨道
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    this.pc.addTrack(stream.getTracks()[0], stream);
+
+                    // 创建数据通道
+                    this.dataChannel = this.pc.createDataChannel('oai-events');
+                    this.setupDataChannel();
+
+                    // 创建offer
+                    const offer = await this.pc.createOffer();
+                    await this.pc.setLocalDescription(offer);
+
+                    // 连接到OpenAI的Realtime API
+                    const baseUrl = 'https://api.openai.com/v1/realtime';
+                    const model = 'gpt-4o-realtime-preview-2024-12-17';
+                    const sdpResponse = await fetch(`${baseUrl}?model=${model}`, {
+                        method: 'POST',
+                        body: offer.sdp,
+                        headers: {
+                            'Authorization': `Bearer ${token}`,
+                            'Content-Type': 'application/sdp'
+                        }
+                    });
+
+                    if (!sdpResponse.ok) {
+                        throw new Error(`Failed to connect to OpenAI: ${await sdpResponse.text()}`);
+                    }
+
+                    // 配置session
+                    const sessionUpdate = {
+                        type: 'session.update',
+                        session: {
+                            instructions: `你是一个专业的语音助手, 每次当你接受到新的语音, 先调用process_user_query函数. 把用户说的所有内容, 一字不拉的, 传给这个函数.
+                            然后根据函数的返回, 回复语音.`,
+                            tools: [
+                                {
+                                    type: 'function',
+                                    name: 'process_user_query',
+                                    description: '处理用户命令',
+                                    parameters: {
+                                        type: 'object',
+                                        properties: {
+                                            user_word: {
+                                                type: 'string',
+                                                description: '用户刚才说的所有内容'
+                                            }
+                                        },
+                                        required: ['user_word']
+                                    }
+                                },
+                            ],
+                            tool_choice: 'auto'
+                        }
+                    };
+                    
+                    // 发送session更新
+                    if (this.dataChannel.readyState === 'open') {
+                        this.dataChannel.send(JSON.stringify(sessionUpdate));
+                    } else {
+                        this.sessionUpdatePending = sessionUpdate;
+                    }
+
+                    const answer = {
+                        type: 'answer',
+                        sdp: await sdpResponse.text()
+                    };
+                    await this.pc.setRemoteDescription(answer);
+
+                    this.updateStatus('已连接到服务器', 'connected');
+                    this.startBtn.disabled = false;
+                } catch (error) {
+                    this.updateStatus('连接失败: ' + error.message, 'error');
+                    console.error('初始化错误:', error);
+                }
+            }
+
+            setupDataChannel() {
+                this.dataChannel.onopen = () => {
+                    console.log('数据通道已打开');
+                    this.updateStatus('连接已建立', 'connected');
+                    this.startBtn.disabled = false;
+                    
+                    // 如果有待发送的session更新，现在发送
+                    if (this.sessionUpdatePending) {
+                        this.dataChannel.send(JSON.stringify(this.sessionUpdatePending));
+                        this.sessionUpdatePending = false;
+                    }
+                };
+
+                this.dataChannel.onmessage = async (e) => {
+                    const event = JSON.parse(e.data);
+                    console.log('收到事件:', event);
+
+                    if (event.type === 'response.text.delta') {
+                        this.appendTranscript(event.delta);
+                    } 
+                    else if (event.type === 'response.done' && event.response.output) {
+                        // 处理function call
+                        for (const output of event.response.output) {
+                            if (output.type === 'function_call') {
+                                const args = JSON.parse(output.arguments);
+                                await this.handleFunctionCall(output.name, args, output.call_id);
+                            }
+                        }
+                    }
+                };
+
+                this.dataChannel.onerror = (error) => {
+                    console.error('数据通道错误:', error);
+                    this.updateStatus('数据通道错误', 'error');
+                };
+            }
+
+            async handleFunctionCall(functionName, args, callId) {
+                try {
+                    if (this.dataChannel.readyState !== 'open') {
+                        throw new Error('数据通道未打开');
+                    }
+                    let result;
+                    
+                    // 处理不同的函数调用
+                    switch (functionName) {
+                        case 'process_user_query':
+                            // show the user query
+                            this.appendTranscript(`用户说: ${args.user_word}`);
+                            result = "等待回复..."
+                            // const createresponse = await fetch('/api/tasks', {
+                            //     method: 'post',
+                            //     headers: { 'content-type': 'application/json' },
+                            //     body: json.stringify(args)
+                            // });
+                            // result = await createresponse.json();
+                            break;
+                        default:
+                            throw new Error(`未知的函数: ${functionName}`);
+                    }
+
+                    console.log(`Function Call Result: ${functionName}`, result);
+
+                    // 将函数调用结果发送回OpenAI
+                    const functionCallOutput = {
+                        type: 'conversation.item.create',
+                        item: {
+                            type: 'function_call_output',
+                            call_id: callId,
+                            output: JSON.stringify(result)
+                        }
+                    };
+                    this.dataChannel.send(JSON.stringify(functionCallOutput));
+
+                    // 请求新的响应
+                    const createResponse = {
+                        type: 'response.create'
+                    };
+                    this.dataChannel.send(JSON.stringify(createResponse));
+                } catch (error) {
+                    console.error('函数调用错误:', error);
+                    this.updateStatus('函数调用错误: ' + error.message, 'error');
+                }
+            }
+
+            async startRecording() {
+                try {
+                    if (this.dataChannel.readyState !== 'open') {
+                        throw new Error('请等待连接建立');
+                    }
+
+                    this.startBtn.disabled = true;
+                    this.stopBtn.disabled = false;
+                    this.updateStatus('正在录音...', 'recording');
+
+                    // 创建新的响应
+                    const responseCreate = {
+                        type: 'response.create'
+                    };
+                    this.dataChannel.send(JSON.stringify(responseCreate));
+                } catch (error) {
+                    console.error('录音错误:', error);
+                    this.updateStatus('录音失败: ' + error.message, 'error');
+                }
+            }
+
+            stopRecording() {
+                try {
+                    if (this.dataChannel.readyState !== 'open') {
+                        throw new Error('连接已断开');
+                    }
+
+                    this.startBtn.disabled = false;
+                    this.stopBtn.disabled = true;
+                    this.updateStatus('录音已停止', 'connected');
+
+                    // 发送结束消息
+                    const endResponse = {
+                        type: 'input_audio_buffer.commit'
+                    };
+                    this.dataChannel.send(JSON.stringify(endResponse));
+                } catch (error) {
+                    console.error('停止录音错误:', error);
+                    this.updateStatus('停止录音失败: ' + error.message, 'error');
+                }
+            }
+
+            setupEventListeners() {
+                this.startBtn.onclick = () => this.startRecording();
+                this.stopBtn.onclick = () => this.stopRecording();
+            }
+
+            updateStatus(message, type) {
+                this.statusDiv.textContent = message;
+                this.statusDiv.className = `status ${type}`;
+            }
+
+            appendTranscript(text) {
+                const p = document.createElement('p');
+                p.textContent = text;
+                this.transcriptDiv.appendChild(p);
+                this.transcriptDiv.scrollTop = this.transcriptDiv.scrollHeight;
+            }
+        }
+
+        // 初始化
+        const voiceControl = new VoiceControl();
+    </script>
+</body>
+</html>
