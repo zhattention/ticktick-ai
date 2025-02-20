@@ -5,21 +5,21 @@ from typing import Optional, Any
 from autogen_agentchat.ui._console import Console
 
 class MessageHandler(ABC):
-    """消息处理器接口，用于处理会话消息的发送和接收"""
+    """Message handler interface for handling session message sending and receiving"""
     
     @abstractmethod
     async def send_message(self, message: str) -> None:
-        """发送消息"""
+        """Send message"""
         pass
 
     @abstractmethod
     async def send_error(self, error: str) -> None:
-        """发送错误消息"""
+        """Send error message"""
         pass
 
 
 class WebSocketHandler(MessageHandler):
-    """WebSocket消息处理器实现"""
+    """WebSocket message handler implementation"""
     
     def __init__(self, websocket):
         self.websocket = websocket
@@ -32,7 +32,7 @@ class WebSocketHandler(MessageHandler):
 
 
 class ConsoleHandler(MessageHandler):
-    """控制台消息处理器实现，用于测试"""
+    """Console message handler implementation for testing"""
     
     def __init__(self, show_prefix: bool = True):
         self.show_prefix = show_prefix
@@ -55,58 +55,58 @@ class ConsoleHandler(MessageHandler):
 class Session:
     def __init__(self, team, model_client):
         """
-        初始化 Session 类。
+        Initialize Session class.
         
-        参数：
-            team: 对话团队实例（例如 MagenticOneGroupChat）。
-            model_client: 用于对话的模型客户端。
+        Args:
+            team: Chat team instance (e.g., MagenticOneGroupChat).
+            model_client: Model client for chat.
         """
         self.team = team
         self.model_client = model_client
-        self.stream = None  # 当前的对话流
-        self.is_active = False  # 会话是否活跃
-        self.task = None  # 异步任务，用于执行流
-        self.voice_queue = asyncio.Queue()  # 创建输入队列
+        self.stream = None  # Current conversation stream
+        self.is_active = False  # Whether the session is active
+        self.task = None  # Async task for executing the stream
+        self.voice_queue = asyncio.Queue()  # Create input queue
         self.message_handler: Optional[MessageHandler] = None
 
     async def start_session(self, text: str, message_handler: MessageHandler):
         """
-        开始一个新的会话，创建 stream 并启动执行任务。
+        Start a new session, create stream and start execution task.
         
-        参数：
-            text (str): 用户的初始输入。
-            message_handler (MessageHandler): 消息处理器实例。
+        Args:
+            text (str): Initial user input.
+            message_handler (MessageHandler): Message handler instance.
         """
         if self.is_active:
-            logging.warning("已有活跃会话，无法创建新会话。")
+            logging.warning("Active session exists, cannot create new session.")
             return
 
-        # 设置消息处理器
+        # Set up message handler
         self.message_handler = message_handler
 
-        # 创建新的 stream
+        # Create new stream
         self.stream = self.team.run_stream(task=text)
         self.is_active = True
 
-        # 启动异步任务执行 stream
+        # Start async task to execute stream
         self.task = asyncio.create_task(self.run_stream())
 
     async def run_stream(self):
         """
-        执行 stream 并在完成后发送最终结果。
+        Execute stream and send final results upon completion.
         """
         try:
-            # 执行 stream 并获取结果
+            # Execute stream and get results
             result = await Console(self.stream)
             final_message = result.messages[-1].content if result.messages else "No response generated"
             await self.message_handler.send_message(final_message)
-            logging.info(f"会话结束，已发送最终结果: {final_message}")
+            logging.info(f"Session ended, final result sent: {final_message}")
         except Exception as e:
-            error_msg = f"流执行出错: {str(e)}"
+            error_msg = f"Stream execution error: {str(e)}"
             logging.error(error_msg)
             await self.message_handler.send_error(error_msg)
         finally:
-            # 会话结束，清理状态
+            # Session ended, clean up state
             self.is_active = False
             self.stream = None
             self.task = None
@@ -114,22 +114,22 @@ class Session:
 
     async def handle_input(self, text: str, message_handler: Optional[MessageHandler] = None):
         """
-        处理用户输入。
+        Handle user input.
         
-        如果没有活跃会话，则创建新会话；
-        如果有活跃会话，则将输入注入当前会话。
+        If no active session exists, create a new one;
+        If an active session exists, inject input into current session.
         
-        参数：
-            text (str): 用户输入的文本。
-            message_handler (Optional[MessageHandler]): 消息处理器实例，仅在创建新会话时需要。
+        Args:
+            text (str): User input text.
+            message_handler (Optional[MessageHandler]): Message handler instance, only required when creating a new session.
         """
         if not self.is_active:
-            # 没有活跃会话，创建新会话
+            # No active session, create new one
             if message_handler is None:
-                raise ValueError("创建新会话时必须提供message_handler")
+                raise ValueError("message_handler must be provided when creating a new session")
             await self.start_session(text, message_handler)
-            logging.info(f"创建新会话，初始输入: {text}")
+            logging.info(f"Creating new session with initial input: {text}")
         else:
-            # 有活跃会话，注入输入到当前 stream
+            # Active session exists, inject input into current stream
             await self.voice_queue.put(text)
-            logging.info(f"注入输入到当前会话: {text}")
+            logging.info(f"Injecting input into current session: {text}")
