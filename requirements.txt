@@ -1,0 +1,10 @@
+requests==2.31.0
+pyautogen>=0.2.0
+python-dotenv==1.0.0
+openai>=1.0.0
+fastapi>=0.115.8
+uvicorn>=0.32.1
+pytest>=7.4.0
+autogen-core>=0.2.0
+autogen-ext>=0.2.0
+autogen-agentchat>=0.2.0
