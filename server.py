@@ -28,6 +28,10 @@ logger.addHandler(console_handler)
 # Disable propagation to root logger
 logger.propagate = False
 
+# 配置选项
+USE_DIRECT_AGENT = os.getenv("USE_DIRECT_AGENT", "false").lower() == "true"
+logger.info(f"Using direct agent mode: {USE_DIRECT_AGENT}")
+
 # Initialize FastAPI app
 app = FastAPI()
 
@@ -56,8 +60,8 @@ async def websocket_endpoint(websocket: WebSocket):
     client_id = id(websocket)
     logger.info(f"New WebSocket connection: {client_id}")
     
-    # 为每个连接创建一个新的SessionHandler实例
-    session_handler = SessionHandler()
+    # 为每个连接创建一个新的SessionHandler实例，并设置代理模式
+    session_handler = SessionHandler(use_direct_agent=USE_DIRECT_AGENT)
     await session_handler.initialize()
 
     try:
