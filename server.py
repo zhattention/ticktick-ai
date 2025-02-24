@@ -1,5 +1,6 @@
 import os
 import time
+from autogen_agentchat.messages import TextMessage
 from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -8,13 +9,14 @@ import base64
 import logging
 import asyncio
 from datetime import datetime
-from typing import Optional
+from typing import Awaitable, Callable, Optional, Dict, Tuple
 from autogen_core import CancellationToken
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_agentchat.ui import Console
 from tools.ticktick import TaskManager
+from session import Session, SessionResult
 
 import openai
 from dotenv import load_dotenv
@@ -23,13 +25,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configure logging
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format='%(asctime)s - %(levelname)s - %(message)s'
-# )
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-# logging.getLogger("autogen_core").setLevel(logging.WARNING)
+# Create console handler with formatting
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
 
+# Add handler to logger
+logger.addHandler(console_handler)
+
+# Disable propagation to root logger
+logger.propagate = False
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -51,16 +60,28 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 AUDIO_DIR = "audio_files"
 if not os.path.exists(AUDIO_DIR):
     os.makedirs(AUDIO_DIR)
-    logging.info(f"Created audio directory: {AUDIO_DIR}")
+    logger.info(f"Created audio directory: {AUDIO_DIR}")
 
 # Set up OpenAI
 openai.api_key = os.getenv('OPENAI_API_KEY')
 if not openai.api_key:
     raise ValueError("OPENAI_API_KEY not found in environment variables")
 
-# Global message queue for voice input
-voice_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
-response_queue: asyncio.Queue[str] = asyncio.Queue()
+# Global session storage
+sessions: Dict[int, Session] = {}
+
+class UserInputHelper:
+    def __init__(self):
+        self.user_input_queue = asyncio.Queue()
+
+    def get_user_input_func(self) -> Callable[[str, Optional[CancellationToken]], Awaitable[str]]:
+        async def user_input(prompt: str, cancellation_token: Optional[CancellationToken]) -> str:
+            return await self.user_input_queue.get()
+
+        return user_input
+
+    async def recv_user_input(self, text: str):
+        await self.user_input_queue.put(text)
 
 def process_audio(audio_bytes):
     try:
@@ -73,7 +94,7 @@ def process_audio(audio_bytes):
         
         try:
             # Use OpenAI Whisper API for transcription
-            logging.info("Starting transcription with OpenAI Whisper API...")
+            logger.info("Starting transcription with OpenAI Whisper API...")
             with open(temp_audio, 'rb') as audio_file:
                 response = openai.audio.transcriptions.create(
                     model="whisper-1",
@@ -81,7 +102,7 @@ def process_audio(audio_bytes):
                 )
             
             text = response.text
-            logging.info(f"Final transcription: {text}")
+            logger.info(f"Final transcription: {text}")
             
             return text
             
@@ -91,28 +112,10 @@ def process_audio(audio_bytes):
                 os.remove(temp_audio)
                 
     except Exception as e:
-        logging.error(f"Error processing audio: {e}", exc_info=True)
+        logger.error(f"Error processing audio: {e}", exc_info=True)
         raise
 
-# Custom voice input function for UserProxyAgent
-async def voice_input(prompt: str, cancellation_token: Optional[CancellationToken]) -> str:
-    try:
-        logging.info(f"Waiting for voice input... (Prompt: {prompt})")
-        # Wait for the next message from the queue
-        text = await voice_queue.get()
-        if text is None:
-            raise RuntimeError("Voice input cancelled")
-        logging.info(f"Received voice input: {text}")
-        return text
-    except asyncio.CancelledError:
-        # Handle cancellation
-        await voice_queue.put(None)
-        raise
-    except Exception as e:
-        logging.error(f"Error in voice input: {e}")
-        raise
-
-def task_prompt(user_request: str) -> str:
+def task_prompt(user_request: str, history_digest: str) -> str:
     """Generate a task prompt based on the user's request"""
      # Define task description with available tools
     task_description = """
@@ -163,19 +166,23 @@ Important Notes:
 - Dates must be in YYYY-MM-DD format
 - Task IDs are required for completing and deleting tasks
 - Priority levels: 0=none, 1=low, 3=medium, 5=high
-
-User Request: {user_request}
 """
-    return task_description.format(user_request=user_request)
+    if history_digest:
+        task_description += """
+## Background Information
+User's previous requests have been summarized as follows:
+{history_digest}
+"""
+    task_description += """
+User's new request: {user_request}
+"""
+    return task_description.format(user_request=user_request, history_digest=history_digest)
 
 
 # Initialize agents
-def init_agents():
+def init_agents() -> Tuple[AssistantAgent, UserProxyAgent, OpenAIChatCompletionClient, UserInputHelper]:
     # Get environment variables
     api_key = os.getenv("OPENAI_API_KEY")
-    openrouter_api_key = os.getenv("OPENROUTE_API_KEY")
-    cerebras_api_key = os.getenv("CEREBRAS_API_KEY")
-
     ticktick_client_id = os.getenv("TICKTICK_CLIENT_ID")
     ticktick_client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
     
@@ -188,28 +195,25 @@ def init_agents():
     # Initialize task manager
     task_manager = TaskManager(ticktick_client_id, ticktick_client_secret)
 
-    # Create the model client
     # model_client = OpenAIChatCompletionClient(
-    #     # model="anthropic/claude-3.5-sonnet",
-    #     model="llama-3.3-70b",
-    #     # api_key=openrouter_api_key,
-    #     # api_key=os.getenv("GROQ_API_KEY"),
-    #     api_key=cerebras_api_key,
-    #     base_url="https://api.cerebras.ai/v1",
-    #     # base_url="https://openrouter.ai/api/v1",
-    #     # base_url="https://api.groq.com/openai/v1",
-    #     model_info={
-    #         "vision": False,
-    #         "function_calling": True,
-    #         "json_output": True,
-    #         "family": "unknown",
-    #     },
+    #     model="gpt-4o-mini",
+    #     api_key=openai.api_key,
     # )
 
-
     model_client = OpenAIChatCompletionClient(
-        model="gpt-4o-mini",
-        api_key=openai.api_key,
+        model="llama-3.3-70b",
+        api_key=os.getenv("CEREBRAS_API_KEY"),
+        base_url="https://api.cerebras.ai/v1",
+        model_info={
+            "vision": False,
+            "function_calling": True,
+            "json_output": True,
+            "family": "unknown",
+        },
+        llm_config={
+            "cache_seed": 42,  # Enable caching with seed 42
+            "cache_path_root": ".cache/llm_cache"  # Specify cache directory
+        }
     )
 
     # Create the task management assistant
@@ -262,83 +266,89 @@ def init_agents():
         Say 'goodbye' to end the conversation.
         """,
         tools=[
-            task_manager.create_task,  # 创建任务（支持设置标题、内容、日期、优先级等）
-            task_manager.list_tasks,    # 列出任务（支持日期范围过滤和显示已完成任务）
-            task_manager.complete_task, # 完成任务
-            task_manager.delete_task,   # 删除任务
-            task_manager.get_tasks_by_date,  # 获取指定日期范围的任务
-            task_manager.get_completed_tasks # 获取所有已完成的任务
+            task_manager.create_task,
+            task_manager.list_tasks,
+            task_manager.complete_task,
+            task_manager.delete_task,
+            task_manager.get_tasks_by_date,
+            task_manager.get_completed_tasks
         ],
         model_client=model_client,
     )
 
+    user_input_helper = UserInputHelper()
+
     # Create the user proxy
     user_proxy = UserProxyAgent(
         name="user",
-        input_func=voice_input,
+        input_func=user_input_helper.get_user_input_func(),
     )
 
-    return assistant, user_proxy, model_client
+    return assistant, user_proxy, model_client, user_input_helper
 
 # WebSocket endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+
     client_id = id(websocket)
-    logging.info(f"New WebSocket connection: {client_id}")
+    logger.info(f"New WebSocket connection: {client_id}")
 
-    try:
-        # Initialize agents
-        assistant, user_proxy, model_client = init_agents()
-        
-        # Create the team and initialize the stream
-        team = MagenticOneGroupChat(
-            participants=[user_proxy, assistant],
-            model_client=model_client,
-            max_turns=20,
-            max_stalls=3,
-            final_answer_prompt="Based on our analysis of your request, here is the response:"
-        )
-        stream = None
-        
-        while True:
-            # Receive audio data
+    # Initialize agents and team
+    assistant, user_proxy, model_client, user_input_helper = init_agents()
+    team = MagenticOneGroupChat(
+        participants=[user_proxy, assistant],
+        model_client=model_client,
+        max_turns=20,
+        max_stalls=3,
+        final_answer_prompt="Based on our analysis of your request, here is the response:"
+    )
+    
+    history_digest = ""        
+
+    session = Session(team, model_client)
+
+    while True:
+        # Receive audio data
+        try:
             data = await websocket.receive_text()
-            try:
-                # Decode base64 audio data
-                mime_type = data.split(',')[0].split(':')[1].split(';')[0]
-                logging.info(f"Received audio MIME type: {mime_type}")
-                
-                audio_bytes = base64.b64decode(data.split(',')[1])
-                logging.info(f"Decoded base64 data size: {len(audio_bytes)} bytes")
-                
-                # Process audio to text
-                text = process_audio(audio_bytes)
+            # Decode base64 audio data
 
-                if text:
-                    if stream is None:
-                        stream = team.run_stream(task=task_prompt(text))
-                    else:
-                        # Put the text in the voice queue
-                        await voice_queue.put(text)
-                    
-                    # Send the text to the existing stream
-                    result = await Console(stream)
-                    
-                    # Send the final result to the client
-                    await websocket.send_text(str(result))
-                    logging.info(f"Sent result to client {client_id}: {str(result)}")
-                    
-            except Exception as e:
-                error_msg = f"Error processing request: {str(e)}"
-                logging.error(error_msg, exc_info=True)
-                await websocket.send_text(f"Error: {error_msg}")
-                
-    except Exception as e:
-        logging.error(f"WebSocket error for client {client_id}: {e}", exc_info=True)
-    finally:
-        logging.info(f"WebSocket connection closed: {client_id}")
+            mime_type = data.split(',')[0].split(':')[1].split(';')[0]
+            logger.info(f"Received audio MIME type: {mime_type}")
+            
+            audio_bytes = base64.b64decode(data.split(',')[1])
+            logger.info(f"Decoded base64 data size: {len(audio_bytes)} bytes")
+            
+            # Process audio to text
+            text = process_audio(audio_bytes)
 
+            if text is None or text == "":
+                continue
+
+            if not session.is_active:
+                session.start(task_prompt(text, history_digest))
+            else:
+                await user_input_helper.recv_user_input(text)
+            
+            # continue the inference
+            result: SessionResult = await session.run_until_stop()
+            print(result)
+            if result == SessionResult.FINISHED:
+                history_digest = await session.digest()
+                logger.info(f"History digest: {history_digest}")
+                await websocket.send_text(f"[{result.status}] {history_digest}")
+                session = Session(team, model_client)
+            
+            if result.last_message:
+                await websocket.send_text(f"[{result.status}] {result.last_message}")
+                logger.info(f"Sent result to client {client_id}: [{result.status}] {result.last_message}")
+                
+        except Exception as e:
+            error_msg = f"Error processing request: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            await websocket.send_text(f"Error: {error_msg}")
+            
 # Root route
 @app.get("/")
 async def root():
@@ -365,5 +375,5 @@ async def test_run():
 
 # Run the server
 if __name__ == "__main__":
-    logging.info("Starting server on http://0.0.0.0:8000")
+    logger.info("Starting server on http://0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
