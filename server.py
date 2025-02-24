@@ -48,9 +48,6 @@ openai.api_key = os.getenv('OPENAI_API_KEY')
 if not openai.api_key:
     raise ValueError("OPENAI_API_KEY not found in environment variables")
 
-# Create session handler
-session_handler = SessionHandler()
-
 # WebSocket endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -58,14 +55,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
     client_id = id(websocket)
     logger.info(f"New WebSocket connection: {client_id}")
+    
+    # 为每个连接创建一个新的SessionHandler实例
+    session_handler = SessionHandler()
+    await session_handler.initialize()
 
     try:
         while True:
             # Receive data
             data = await websocket.receive_text()
             
-            # Handle message
-            status, message = await session_handler.handle_message(client_id, data)
+            # Handle message with this connection's session handler
+            status, message = await session_handler.handle_message(data)
             
             # Send response
             if status and message:
